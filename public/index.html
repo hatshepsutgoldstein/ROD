@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -27,6 +28,12 @@
                 <h3>Auto-Extract Data (OCR)</h3>
                 <p>Upload a document to automatically extract field data:</p>
                 
+                <!-- TrOCR Status -->
+                <div id="trocrStatus" style="margin-bottom: 12px; padding: 8px; border-radius: 4px; font-size: 14px;">
+                    <span id="trocrStatusText">Checking TrOCR status...</span>
+                    <button id="installTrocr" style="margin-left: 8px; padding: 4px 8px; font-size: 12px; display: none;" class="btn-secondary">Install TrOCR</button>
+                </div>
+                
                 <div class="form-group">
                     <input type="file" id="ocrFile" accept=".pdf,.jpg,.jpeg,.png,.tif,.tiff">
                     <button type="button" id="processOCR" class="btn-secondary">Process Document</button>
@@ -38,8 +45,13 @@
                 
                 <div id="ocrResults">
                     <strong>Extracted Fields:</strong>
+                    <div id="verificationBanner" style="display:none;color:#b45309;background:#fef3c7;border:1px solid #fcd34d;padding:8px;margin:8px 0;border-radius:4px;">
+                        Verification required: Some fields have low confidence. Please review highlighted values.
+                    </div>
                     <div id="extractedFields"></div>
                     <button type="button" id="useExtracted" class="btn-secondary">Use These Fields</button>
+                    <button type="button" id="manualEntry" class="btn-secondary" style="display:none; margin-left: 8px;">Fill Form Manually</button>
+                    <button type="button" id="viewDocument" class="btn-secondary" style="display:none; margin-left: 8px;">View Document</button>
                 </div>
             </div>
             
@@ -140,6 +152,49 @@
             <button class="btn-secondary close-viewer" onclick="closeViewer()">Close</button>
             <div id="fileContent"></div>
         </div>
+
+        <!-- Document Preview Modal for Manual Entry -->
+        <div id="documentPreviewModal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>Document Preview - Manual Entry</h3>
+                    <button class="close-modal" onclick="closeDocumentPreview()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="preview-container">
+                        <div class="document-preview">
+                            <div id="documentPreviewContent"></div>
+                        </div>
+                        <div class="form-sidebar">
+                            <h4>Fill Form While Viewing Document</h4>
+                            <p>Use the document preview to help you fill out the form fields accurately.</p>
+                            <div class="form-fields-preview">
+                                <div class="field-group">
+                                    <label>Spouse 1 Name:</label>
+                                    <input type="text" id="previewSpouse1" placeholder="Enter first spouse name">
+                                </div>
+                                <div class="field-group">
+                                    <label>Spouse 2 Name:</label>
+                                    <input type="text" id="previewSpouse2" placeholder="Enter second spouse name">
+                                </div>
+                                <div class="field-group">
+                                    <label>Marriage Date:</label>
+                                    <input type="date" id="previewMarriageDate">
+                                </div>
+                                <div class="field-group">
+                                    <label>License Number:</label>
+                                    <input type="text" id="previewLicenseNumber" placeholder="Enter license number">
+                                </div>
+                            </div>
+                            <div class="modal-actions">
+                                <button type="button" id="applyPreviewData" class="btn-primary">Apply to Form</button>
+                                <button type="button" onclick="closeDocumentPreview()" class="btn-secondary">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -181,11 +236,14 @@
                 
                 if (result.success) {
                     extractedData = result.extractedFields;
-                    displayExtractedFields(result.extractedFields);
+                    displayExtractedFields(result.extractedFields, result.needsVerification === true);
                     results.style.display = 'block';
                     
-                    if (result.error) {
-                        console.warn('OCR completed with warnings:', result.error);
+                    if (result.needsVerification) {
+                        alert('Please verify extracted fields. Some values are low confidence.');
+                    }
+                    if (Array.isArray(result.warnings) && result.warnings.length) {
+                        console.warn('OCR warnings:', result.warnings.join('; '));
                     }
                 } else {
                     alert('OCR processing failed: ' + (result.error || 'Unknown error'));
@@ -199,7 +257,7 @@
         });
 
         // Display extracted fields
-        function displayExtractedFields(fields) {
+        function displayExtractedFields(fields, needsVerification = false) {
             const container = document.getElementById('extractedFields');
             container.innerHTML = '';
             
@@ -210,21 +268,66 @@
                 license_number: 'License Number'
             };
             
+            const banner = document.getElementById('verificationBanner');
+            
             let hasData = false;
-            for (const [key, value] of Object.entries(fields)) {
+            let hasLowConfidence = false;
+            
+            for (const [key, obj] of Object.entries(fields)) {
+                const value = typeof obj === 'object' && obj !== null ? (obj.value || '') : (obj || '');
+                const conf = typeof obj === 'object' && obj !== null && typeof obj.confidence === 'number' ? obj.confidence : null;
                 if (value && value.trim()) {
                     hasData = true;
                     const fieldDiv = document.createElement('div');
-                    fieldDiv.innerHTML = `<strong>${fieldLabels[key]}:</strong> ${value}`;
+                    const low = conf !== null && conf < 0.8;
+                    if (low) hasLowConfidence = true;
+                    
+                    fieldDiv.style.padding = '8px 12px';
+                    fieldDiv.style.margin = '4px 0';
+                    fieldDiv.style.borderRadius = '6px';
+                    fieldDiv.style.border = '1px solid #e5e7eb';
+                    fieldDiv.style.backgroundColor = low ? '#fef2f2' : '#f9fafb';
+                    
+                    if (low) {
+                        fieldDiv.style.borderColor = '#fecaca';
+                        fieldDiv.style.backgroundColor = '#fef2f2';
+                    }
+                    
+                    const confText = conf !== null ? ` <span style="color:${low ? '#b91c1c' : '#065f46'}; font-weight: 500;">(confidence: ${(conf*100).toFixed(0)}%)</span>` : '';
+                    fieldDiv.innerHTML = `<strong>${fieldLabels[key]}:</strong> ${value}${confText}`;
                     container.appendChild(fieldDiv);
                 }
             }
             
+            // Only show verification banner if we have data AND low confidence
+            banner.style.display = (hasData && hasLowConfidence) ? 'block' : 'none';
+            
             if (!hasData) {
-                container.innerHTML = '<em>No field data could be extracted automatically. You can still fill the form manually.</em>';
+                container.innerHTML = `
+                    <div style="padding: 16px; background: #f3f4f6; border: 1px solid #d1d5db; border-radius: 6px; margin: 8px 0;">
+                        <div style="color: #6b7280; margin-bottom: 8px;">
+                            <strong>⚠️ OCR could not extract fields from this document</strong>
+                        </div>
+                        <div style="color: #6b7280; font-size: 14px; margin-bottom: 12px;">
+                            This often happens with cursive handwriting or poor image quality. You can still fill the form manually below.
+                        </div>
+                        <div style="color: #6b7280; font-size: 13px;">
+                            <strong>Tips for better OCR:</strong>
+                            <ul style="margin: 4px 0; padding-left: 16px;">
+                                <li>Ensure the document is straight and well-lit</li>
+                                <li>Try scanning at higher resolution (300+ DPI)</li>
+                                <li>For cursive documents, manual entry may be more accurate</li>
+                            </ul>
+                        </div>
+                    </div>
+                `;
                 document.getElementById('useExtracted').style.display = 'none';
+                document.getElementById('manualEntry').style.display = 'inline-block';
+                document.getElementById('viewDocument').style.display = 'inline-block';
             } else {
                 document.getElementById('useExtracted').style.display = 'inline-block';
+                document.getElementById('manualEntry').style.display = 'none';
+                document.getElementById('viewDocument').style.display = 'none';
             }
         }
 
@@ -255,6 +358,139 @@
                 
                 alert('Fields populated with extracted data! Review and submit when ready.');
             }
+        });
+
+        // Manual entry button - scroll to form and highlight fields
+        document.getElementById('manualEntry').addEventListener('click', () => {
+            // Copy the file from OCR input to the main form
+            const ocrFile = document.getElementById('ocrFile').files[0];
+            if (ocrFile) {
+                const dt = new DataTransfer();
+                dt.items.add(ocrFile);
+                document.getElementById('document').files = dt.files;
+            }
+            
+            // Scroll to the form
+            document.getElementById('addForm').scrollIntoView({ behavior: 'smooth' });
+            
+            // Highlight the form fields
+            const formFields = ['spouse1', 'spouse2', 'marriageDate', 'licenseNumber'];
+            formFields.forEach(fieldId => {
+                const field = document.getElementById(fieldId);
+                field.style.border = '2px solid #3b82f6';
+                field.style.backgroundColor = '#eff6ff';
+                field.focus();
+                
+                // Remove highlight after 3 seconds
+                setTimeout(() => {
+                    field.style.border = '';
+                    field.style.backgroundColor = '';
+                }, 3000);
+            });
+            
+            alert('Please fill in the form fields manually. The document has been attached automatically.');
+        });
+
+        // View document button - open preview modal
+        document.getElementById('viewDocument').addEventListener('click', () => {
+            const ocrFile = document.getElementById('ocrFile').files[0];
+            if (ocrFile) {
+                openDocumentPreview(ocrFile);
+            }
+        });
+
+        // Open document preview modal
+        function openDocumentPreview(file) {
+            const modal = document.getElementById('documentPreviewModal');
+            const previewContent = document.getElementById('documentPreviewContent');
+            
+            // Create object URL for the file
+            const fileUrl = URL.createObjectURL(file);
+            
+            // Determine file type and create appropriate preview
+            const fileExtension = file.name.split('.').pop().toLowerCase();
+            
+            if (fileExtension === 'pdf') {
+                previewContent.innerHTML = `<iframe src="${fileUrl}" style="width: 100%; height: 600px; border: none;"></iframe>`;
+            } else if (['jpg', 'jpeg', 'png', 'gif', 'tiff', 'tif'].includes(fileExtension)) {
+                previewContent.innerHTML = `<img src="${fileUrl}" style="max-width: 100%; height: auto;" alt="Document preview">`;
+            } else {
+                previewContent.innerHTML = `<p>Preview not available for this file type. Please use the manual entry form below.</p>`;
+            }
+            
+            // Clear previous form data
+            document.getElementById('previewSpouse1').value = '';
+            document.getElementById('previewSpouse2').value = '';
+            document.getElementById('previewMarriageDate').value = '';
+            document.getElementById('previewLicenseNumber').value = '';
+            
+            // Show modal
+            modal.style.display = 'flex';
+            
+            // Clean up object URL when modal is closed
+            modal.addEventListener('click', function cleanup(e) {
+                if (e.target === modal) {
+                    URL.revokeObjectURL(fileUrl);
+                    modal.removeEventListener('click', cleanup);
+                }
+            });
+        }
+
+        // Close document preview modal
+        function closeDocumentPreview() {
+            const modal = document.getElementById('documentPreviewModal');
+            modal.style.display = 'none';
+            
+            // Clean up any object URLs
+            const previewContent = document.getElementById('documentPreviewContent');
+            const iframe = previewContent.querySelector('iframe');
+            if (iframe) {
+                URL.revokeObjectURL(iframe.src);
+            }
+            const img = previewContent.querySelector('img');
+            if (img) {
+                URL.revokeObjectURL(img.src);
+            }
+        }
+
+        // Apply preview data to main form
+        document.getElementById('applyPreviewData').addEventListener('click', () => {
+            // Copy data from preview form to main form
+            document.getElementById('spouse1').value = document.getElementById('previewSpouse1').value;
+            document.getElementById('spouse2').value = document.getElementById('previewSpouse2').value;
+            document.getElementById('marriageDate').value = document.getElementById('previewMarriageDate').value;
+            document.getElementById('licenseNumber').value = document.getElementById('previewLicenseNumber').value;
+            
+            // Copy the file from OCR input to the main form
+            const ocrFile = document.getElementById('ocrFile').files[0];
+            if (ocrFile) {
+                const dt = new DataTransfer();
+                dt.items.add(ocrFile);
+                document.getElementById('document').files = dt.files;
+            }
+            
+            // Close modal
+            closeDocumentPreview();
+            
+            // Scroll to the form and highlight filled fields
+            document.getElementById('addForm').scrollIntoView({ behavior: 'smooth' });
+            
+            const formFields = ['spouse1', 'spouse2', 'marriageDate', 'licenseNumber'];
+            formFields.forEach(fieldId => {
+                const field = document.getElementById(fieldId);
+                if (field.value.trim()) {
+                    field.style.border = '2px solid #10b981';
+                    field.style.backgroundColor = '#d1fae5';
+                    
+                    // Remove highlight after 3 seconds
+                    setTimeout(() => {
+                        field.style.border = '';
+                        field.style.backgroundColor = '';
+                    }, 3000);
+                }
+            });
+            
+            alert('Form populated with your data! Review and submit when ready.');
         });
 
         // Tab functionality
@@ -454,8 +690,68 @@
             }, 5000);
         }
 
+        // Check TrOCR status on page load
+        async function checkTrOCRStatus() {
+            try {
+                const response = await fetch('/api/trocr/status');
+                const result = await response.json();
+                
+                const statusDiv = document.getElementById('trocrStatus');
+                const statusText = document.getElementById('trocrStatusText');
+                const installBtn = document.getElementById('installTrocr');
+                
+                if (result.available) {
+                    statusDiv.style.backgroundColor = '#d1fae5';
+                    statusDiv.style.border = '1px solid #10b981';
+                    statusText.textContent = '✅ TrOCR available for cursive handwriting recognition';
+                    installBtn.style.display = 'none';
+                } else {
+                    statusDiv.style.backgroundColor = '#fef3c7';
+                    statusDiv.style.border = '1px solid #f59e0b';
+                    statusText.textContent = '⚠️ TrOCR not available - install for better cursive recognition';
+                    installBtn.style.display = 'inline-block';
+                }
+            } catch (error) {
+                console.error('Failed to check TrOCR status:', error);
+                const statusDiv = document.getElementById('trocrStatus');
+                const statusText = document.getElementById('trocrStatusText');
+                statusDiv.style.backgroundColor = '#fef2f2';
+                statusDiv.style.border = '1px solid #ef4444';
+                statusText.textContent = '❌ Failed to check TrOCR status';
+            }
+        }
+
+        // Install TrOCR dependencies
+        document.getElementById('installTrocr').addEventListener('click', async () => {
+            const installBtn = document.getElementById('installTrocr');
+            const statusText = document.getElementById('trocrStatusText');
+            
+            installBtn.disabled = true;
+            installBtn.textContent = 'Installing...';
+            statusText.textContent = 'Installing TrOCR dependencies...';
+            
+            try {
+                const response = await fetch('/api/trocr/install', { method: 'POST' });
+                const result = await response.json();
+                
+                if (result.success) {
+                    statusText.textContent = '✅ TrOCR installed successfully! Refresh page to use.';
+                    installBtn.style.display = 'none';
+                } else {
+                    statusText.textContent = '❌ Installation failed: ' + (result.message || 'Unknown error');
+                    installBtn.disabled = false;
+                    installBtn.textContent = 'Install TrOCR';
+                }
+            } catch (error) {
+                statusText.textContent = '❌ Installation failed: ' + error.message;
+                installBtn.disabled = false;
+                installBtn.textContent = 'Install TrOCR';
+            }
+        });
+
         // Load all records on page load
         window.addEventListener('load', () => {
+            checkTrOCRStatus();
             // You can uncomment this line to show all records when the search tab is opened
             // performSearch(new URLSearchParams());
         });

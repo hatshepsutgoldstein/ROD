@@ -4,9 +4,14 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const Tesseract = require('tesseract.js');
+const pdfParse = require('pdf-parse');
+const TrOCRIntegration = require('./trocr_integration');
 
 const app = express();
 const PORT = 3000;
+
+// Initialize TrOCR integration
+const trocrIntegration = new TrOCRIntegration();
 
 // Initialize SQLite database
 const db = new sqlite3.Database('./database.db', (err) => {
@@ -70,7 +75,7 @@ const upload = multer({
 
 // OCR endpoint for processing uploaded files
 app.post('/api/ocr', upload.single('document'), async (req, res) => {
-    console.log('OCR route called'); // Already present
+    console.log('OCR route called');
     if (!req.file) {
         console.log('No file uploaded to OCR endpoint');
         return res.status(400).json({ error: 'No file uploaded' });
@@ -80,8 +85,34 @@ app.post('/api/ocr', upload.single('document'), async (req, res) => {
     console.log('File uploaded for OCR:', filePath);
 
     try {
-        const ocrResult = await extractTextFromDocument(filePath);
-        console.log('OCR result:', ocrResult);
+        // First try standard OCR (Tesseract)
+        let ocrResult = await extractTextFromDocument(filePath);
+        console.log('Standard OCR result:', ocrResult);
+
+        // If standard OCR fails or has very low confidence, try TrOCR
+        const hasLowConfidence = ocrResult.needsVerification && 
+            Object.values(ocrResult.extractedFields).some(field => 
+                !field.value || field.value.trim().length === 0 || field.confidence < 0.3
+            );
+
+        if (hasLowConfidence && trocrIntegration.isAvailable) {
+            console.log('Standard OCR had low confidence, trying TrOCR...');
+            const trocrResult = await trocrIntegration.extractTextWithTrOCR(filePath);
+            
+            if (trocrResult.success) {
+                console.log('TrOCR result:', trocrResult);
+                
+                // Use TrOCR result if it has better field extraction
+                const trocrHasData = Object.values(trocrResult.extractedFields).some(field => 
+                    field.value && field.value.trim().length > 0
+                );
+                
+                if (trocrHasData) {
+                    ocrResult = trocrResult;
+                    console.log('Using TrOCR result for better cursive recognition');
+                }
+            }
+        }
 
         // Clean up temporary file
         fs.unlinkSync(filePath);
@@ -91,6 +122,8 @@ app.post('/api/ocr', upload.single('document'), async (req, res) => {
             success: true,
             extractedText: ocrResult.text,
             extractedFields: ocrResult.extractedFields,
+            needsVerification: ocrResult.needsVerification,
+            warnings: ocrResult.warnings || [],
             error: ocrResult.error
         });
     } catch (error) {
@@ -111,6 +144,43 @@ app.post('/api/ocr', upload.single('document'), async (req, res) => {
 // Serve main page
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Serve API documentation
+app.get('/docs', (req, res) => {
+    res.sendFile(path.join(__dirname, 'docs.html'));
+});
+
+// Serve OpenAPI spec
+app.get('/api-spec.yaml', (req, res) => {
+    res.sendFile(path.join(__dirname, 'api-spec.yaml'));
+});
+
+// TrOCR status and installation endpoints
+app.get('/api/trocr/status', (req, res) => {
+    res.json({
+        available: trocrIntegration.isAvailable,
+        message: trocrIntegration.isAvailable ? 
+            'TrOCR is available for cursive handwriting recognition' : 
+            'TrOCR not available - install Python dependencies to enable'
+    });
+});
+
+app.post('/api/trocr/install', async (req, res) => {
+    try {
+        const success = await trocrIntegration.installDependencies();
+        res.json({
+            success,
+            message: success ? 
+                'TrOCR dependencies installed successfully' : 
+                'Failed to install TrOCR dependencies'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Installation failed: ' + error.message
+        });
+    }
 });
 
 // Add new marriage license record
@@ -283,33 +353,223 @@ process.on('SIGINT', () => {
     });
 });
 
+function normalizeWhitespace(str) {
+    return (str || '').replace(/[\t ]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
+}
+
+function makeField(value, confidence) {
+    return { value: value || '', confidence: Number.isFinite(confidence) ? confidence : 0 };
+}
+
 function extractFieldsFromText(text) {
     const fields = {};
-    const licenseMatch = text.match(/License Number:\s*(.+)/i);
-    const brideMatch = text.match(/Bride Name:\s*(.+)/i);
-    const groomMatch = text.match(/Groom Name:\s*(.+)/i);
-    const dateMatch = text.match(/Marriage Date:\s*(.+)/i);
+    const lines = normalizeWhitespace(text).split(/\n+/).map(l => l.trim());
+    const joined = lines.join('\n');
 
-    if (licenseMatch) fields.license_number = licenseMatch[1].trim();
-    if (brideMatch) fields.name_spouse1 = brideMatch[1].trim();
-    if (groomMatch) fields.name_spouse2 = groomMatch[1].trim();
-    if (dateMatch) fields.marriage_date = dateMatch[1].trim();
+    // License/Application number
+    let licenseNumber = null;
+    let m = joined.match(/Application\s*No\.?\s*([A-Z0-9\-]+)/i) || joined.match(/License\s*(?:No\.|Number)\s*[:#]?\s*([A-Z0-9\-]+)/i);
+    if (m) licenseNumber = m[1];
 
+    // Names after "I, <Name>" in male/female affidavit sections
+    // We look for first significant comma segment after "I," lines
+    let maleAff = lines.find(l => /affidavit\s*of\s*male/i.test(l));
+    let femaleAff = lines.find(l => /affidavit\s*of\s*female/i.test(l));
+
+    function findNameAfterI(sectionIndexStart) {
+        if (sectionIndexStart < 0) return null;
+        for (let i = sectionIndexStart; i < Math.min(sectionIndexStart + 8, lines.length); i++) {
+            const line = lines[i];
+            const nm = line.match(/\bI[, ]+([^,]+?)(?:,|\sof|\sdesir|\sdo\b)/i);
+            if (nm && nm[1]) return nm[1].trim();
+        }
+        return null;
+    }
+
+    const maleIndex = lines.findIndex(l => /affidavit\s*of\s*male/i.test(l));
+    const femaleIndex = lines.findIndex(l => /affidavit\s*of\s*female/i.test(l));
+    let groomName = findNameAfterI(maleIndex);
+    let brideName = findNameAfterI(femaleIndex);
+
+    // Date: look for "day of <Month> <year>" or typical formats
+    let dateValue = null;
+    m = joined.match(/day\s+of\s+([A-Za-z]+)\s+(\d{1,2})?,?\s*(\d{4})/i);
+    if (m) {
+        const month = m[1];
+        const day = m[2] ? m[2].padStart(2, '0') : '01';
+        const year = m[3];
+        dateValue = `${year}-${month}-${day}`; // keep human-ish, frontend may reformat
+    } else {
+        m = joined.match(/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
+        if (m) dateValue = `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+    }
+
+    // We cannot compute OCR confidences from pdf-parse text; default mid confidence.
+    // True word-level confidences are added later when using Tesseract output metadata.
+    fields.license_number = makeField(licenseNumber, 0.6);
+    fields.name_spouse1 = makeField(brideName || groomName, 0.6); // spouse1 arbitrary
+    fields.name_spouse2 = makeField(groomName || brideName, 0.6);
+    fields.marriage_date = makeField(dateValue, 0.6);
     return fields;
 }
 
 // Update your extractTextFromDocument function:
 async function extractTextFromDocument(filePath) {
+    const warnings = [];
     try {
         console.log('Starting OCR for file:', filePath);
-        const result = await Tesseract.recognize(filePath, 'eng');
-        const text = result.data.text;
-        console.log('OCR text output:', text);
-        const extractedFields = extractFieldsFromText(text);
-        console.log('Extracted fields:', extractedFields);
-        return { text, extractedFields, error: null };
+        const ext = path.extname(filePath).toLowerCase();
+        let text = '';
+        let fieldsWithConfidence = {};
+
+        if (ext === '.pdf') {
+            try {
+                const dataBuffer = fs.readFileSync(filePath);
+                const pdfData = await pdfParse(dataBuffer);
+                text = normalizeWhitespace(pdfData.text || '');
+                if (!text.trim()) warnings.push('PDF text empty; falling back to OCR');
+            } catch (err) {
+                warnings.push('PDF parse failed; falling back to OCR');
+            }
+        }
+
+        // If no text yet, use Tesseract OCR
+        if (!text || text.trim().length < 20) {
+            const result = await Tesseract.recognize(filePath, 'eng', {
+                tessedit_char_blacklist: '{}[]<>',
+            });
+            text = normalizeWhitespace(result.data.text || '');
+
+            // Build word index for confidences
+            const words = Array.isArray(result.data.words) ? result.data.words : [];
+            const joinedLower = text.toLowerCase();
+            function confidenceForRegex(regex) {
+                const match = joinedLower.match(regex);
+                if (!match || !match[1]) return 0.5;
+                const value = match[1].trim();
+                // Approximate: average confidence of words that appear in the value
+                const tokens = value.split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
+                if (tokens.length === 0) return 0.5;
+                const tokenConf = tokens.map(tok => {
+                    const w = words.find(wd => (wd.text || '').toLowerCase().includes(tok));
+                    return w ? (wd.confidence || 0) / 100 : 0.5;
+                });
+                return tokenConf.reduce((a, b) => a + b, 0) / tokenConf.length;
+            }
+
+            // Extract using multiple regex patterns for better cursive handling
+            const fields = {};
+            
+            // License number patterns (more flexible)
+            const licPatterns = [
+                /application\s*no\.?\s*([a-z0-9\-]+)/i,
+                /license\s*(?:no\.|number)\s*[:#]?\s*([a-z0-9\-]+)/i,
+                /no\.?\s*([0-9]+)/i
+            ];
+            
+            // Name patterns (more flexible for cursive)
+            const malePatterns = [
+                /affidavit\s*of\s*male[\s\S]{0,200}?\bI[, ]+([^,\n]+?)(?:,|\sof|\sdesir|\sdo\b)/i,
+                /male[\s\S]{0,100}?I[, ]+([^,\n]+?)(?:,|\sof|\sdesir|\sdo\b)/i,
+                /I[, ]+([A-Za-z\s]+?)(?:,|\sof|\sdesir|\sdo\b)/i
+            ];
+            
+            const femalePatterns = [
+                /affidavit\s*of\s*female[\s\S]{0,200}?\bI[, ]+([^,\n]+?)(?:,|\sof|\sdo\b)/i,
+                /female[\s\S]{0,100}?I[, ]+([^,\n]+?)(?:,|\sof|\sdo\b)/i,
+                /Miss\s+([A-Za-z\s]+?)(?:,|\sof|\sdo\b)/i
+            ];
+            
+            // Date patterns (more flexible)
+            const datePatterns = [
+                /day\s+of\s+([A-Za-z]+)\s+(\d{1,2})?,?\s*(\d{4})/i,
+                /(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})/,
+                /(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/,
+                /([A-Za-z]+)\s+(\d{1,2}),?\s*(\d{4})/i
+            ];
+
+            // Try each pattern and pick the best match
+            let licVal = '';
+            let licConf = 0;
+            for (const pattern of licPatterns) {
+                const match = text.match(pattern);
+                if (match && match[1]) {
+                    const conf = confidenceForRegex(pattern);
+                    if (conf > licConf) {
+                        licVal = match[1].trim();
+                        licConf = conf;
+                    }
+                }
+            }
+
+            let groomVal = '';
+            let groomConf = 0;
+            for (const pattern of malePatterns) {
+                const match = text.match(pattern);
+                if (match && match[1]) {
+                    const conf = confidenceForRegex(pattern);
+                    if (conf > groomConf) {
+                        groomVal = match[1].trim();
+                        groomConf = conf;
+                    }
+                }
+            }
+
+            let brideVal = '';
+            let brideConf = 0;
+            for (const pattern of femalePatterns) {
+                const match = text.match(pattern);
+                if (match && match[1]) {
+                    const conf = confidenceForRegex(pattern);
+                    if (conf > brideConf) {
+                        brideVal = match[1].trim();
+                        brideConf = conf;
+                    }
+                }
+            }
+
+            let dateVal = '';
+            let dateConf = 0;
+            for (const pattern of datePatterns) {
+                const match = text.match(pattern);
+                if (match) {
+                    const conf = confidenceForRegex(pattern);
+                    if (conf > dateConf) {
+                        // Format date based on pattern
+                        if (pattern.source.includes('day\\s+of')) {
+                            const month = match[1];
+                            const day = match[2] ? match[2].padStart(2, '0') : '01';
+                            const year = match[3];
+                            dateVal = `${year}-${month}-${day}`;
+                        } else if (pattern.source.includes('(\\\\d{4})[-\/]')) {
+                            dateVal = `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(2, '0')}`;
+                        } else {
+                            dateVal = `${match[3]}-${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}`;
+                        }
+                        dateConf = conf;
+                    }
+                }
+            }
+
+            fields.license_number = makeField(licVal, licConf);
+            fields.name_spouse1 = makeField(brideVal || groomVal, brideVal ? brideConf : groomConf);
+            fields.name_spouse2 = makeField(groomVal || brideVal, groomVal ? groomConf : brideConf);
+            fields.marriage_date = makeField(dateVal, dateConf);
+
+            fieldsWithConfidence = fields;
+        } else {
+            fieldsWithConfidence = extractFieldsFromText(text);
+        }
+
+        // Determine verification need
+        const threshold = 0.8;
+        const needsVerification = Object.values(fieldsWithConfidence).some(f => !f.value || f.value.trim().length === 0 || (f.confidence || 0) < threshold);
+
+        console.log('OCR text output length:', text.length);
+        console.log('Extracted fields:', fieldsWithConfidence);
+        return { text, extractedFields: fieldsWithConfidence, needsVerification, warnings, error: null };
     } catch (error) {
         console.error('Error during OCR:', error);
-        return { text: '', extractedFields: {}, error: error.message };
+        return { text: '', extractedFields: {}, needsVerification: true, warnings, error: error.message };
     }
 }

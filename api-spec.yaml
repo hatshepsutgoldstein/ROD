@@ -1,0 +1,853 @@
+openapi: 3.0.3
+info:
+  title: ROD Marriage License Database API
+  description: |
+    API for managing marriage license records with OCR capabilities and authentication.
+    This system is designed for LAN-only use by ROD employees.
+  version: 1.0.0
+  contact:
+    name: ROD IT Department
+    email: it@rod.gov
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://rod-marriage-db.internal
+    description: Internal ROD network server
+
+security:
+  - JWT: []
+  - BasicAuth: []
+
+paths:
+  /api/ocr:
+    post:
+      summary: Extract text and fields from document using OCR
+      description: |
+        Processes uploaded documents (PDF, images) to extract text and structured field data.
+        Returns confidence scores and verification flags for human review.
+      tags:
+        - OCR
+      security:
+        - JWT: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                document:
+                  type: string
+                  format: binary
+                  description: Document file (PDF, JPG, PNG, TIFF)
+              required:
+                - document
+      responses:
+        '200':
+          description: OCR processing successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  extractedText:
+                    type: string
+                    description: Raw OCR text output
+                    example: "Application No. 37014 for License to Marry..."
+                  extractedFields:
+                    type: object
+                    description: Structured field data with confidence scores
+                    properties:
+                      name_spouse1:
+                        type: object
+                        properties:
+                          value:
+                            type: string
+                            example: "Mary Orlowska"
+                          confidence:
+                            type: number
+                            minimum: 0
+                            maximum: 1
+                            example: 0.85
+                      name_spouse2:
+                        type: object
+                        properties:
+                          value:
+                            type: string
+                            example: "Josef PaezKowski"
+                          confidence:
+                            type: number
+                            minimum: 0
+                            maximum: 1
+                            example: 0.92
+                      marriage_date:
+                        type: object
+                        properties:
+                          value:
+                            type: string
+                            format: date
+                            example: "1890-02-12"
+                          confidence:
+                            type: number
+                            minimum: 0
+                            maximum: 1
+                            example: 0.78
+                      license_number:
+                        type: object
+                        properties:
+                          value:
+                            type: string
+                            example: "37014"
+                          confidence:
+                            type: number
+                            minimum: 0
+                            maximum: 1
+                            example: 0.95
+                  needsVerification:
+                    type: boolean
+                    description: True if any field has low confidence or is missing
+                    example: true
+                  warnings:
+                    type: array
+                    items:
+                      type: string
+                    description: OCR processing warnings
+                    example: ["PDF text empty; falling back to OCR"]
+                  error:
+                    type: string
+                    nullable: true
+                    description: Error message if processing failed
+        '400':
+          description: Bad request - no file uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - invalid or missing JWT token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error during OCR processing
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/licenses:
+    get:
+      summary: Search marriage license records
+      description: |
+        Search marriage license records by various criteria.
+        Returns paginated results with optional filtering.
+      tags:
+        - Marriage Licenses
+      security:
+        - JWT: []
+      parameters:
+        - name: id
+          in: query
+          description: Specific record ID
+          required: false
+          schema:
+            type: integer
+            example: 123
+        - name: name
+          in: query
+          description: Search by spouse name (partial match)
+          required: false
+          schema:
+            type: string
+            example: "Smith"
+        - name: date_from
+          in: query
+          description: Start date for date range search
+          required: false
+          schema:
+            type: string
+            format: date
+            example: "2023-01-01"
+        - name: date_to
+          in: query
+          description: End date for date range search
+          required: false
+          schema:
+            type: string
+            format: date
+            example: "2023-12-31"
+        - name: license_number
+          in: query
+          description: Search by license number (partial match)
+          required: false
+          schema:
+            type: string
+            example: "37014"
+        - name: page
+          in: query
+          description: Page number for pagination
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          description: Number of records per page
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MarriageLicense'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    post:
+      summary: Create new marriage license record
+      description: |
+        Add a new marriage license record with document upload.
+        Can be used with OCR-extracted data or manual entry.
+      tags:
+        - Marriage Licenses
+      security:
+        - JWT: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                name_spouse1:
+                  type: string
+                  description: First spouse name
+                  example: "Mary Orlowska"
+                name_spouse2:
+                  type: string
+                  description: Second spouse name
+                  example: "Josef PaezKowski"
+                marriage_date:
+                  type: string
+                  format: date
+                  description: Marriage date
+                  example: "1890-02-12"
+                license_number:
+                  type: string
+                  description: License or application number
+                  example: "37014"
+                document:
+                  type: string
+                  format: binary
+                  description: Document file (PDF, JPG, PNG, TIFF)
+              required:
+                - name_spouse1
+                - name_spouse2
+                - marriage_date
+                - document
+      responses:
+        '201':
+          description: Marriage license record created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  id:
+                    type: integer
+                    description: New record ID
+                    example: 123
+                  message:
+                    type: string
+                    example: "Marriage license record added successfully"
+        '400':
+          description: Bad request - missing required fields or invalid file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/licenses/{id}:
+    get:
+      summary: Get specific marriage license record
+      description: Retrieve a single marriage license record by ID
+      tags:
+        - Marriage Licenses
+      security:
+        - JWT: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Record ID
+          schema:
+            type: integer
+            example: 123
+      responses:
+        '200':
+          description: Marriage license record found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarriageLicense'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    delete:
+      summary: Delete marriage license record
+      description: |
+        Delete a marriage license record and its associated document file.
+        This action cannot be undone.
+      tags:
+        - Marriage Licenses
+      security:
+        - JWT: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Record ID to delete
+          schema:
+            type: integer
+            example: 123
+      responses:
+        '200':
+          description: Record deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Record deleted successfully"
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Record not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/login:
+    post:
+      summary: Authenticate user
+      description: |
+        Authenticate ROD employee with username/password and optional MFA.
+        Returns JWT token for subsequent API calls.
+      tags:
+        - Authentication
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  description: Employee username
+                  example: "jdoe"
+                password:
+                  type: string
+                  format: password
+                  description: Employee password
+                  example: "securePassword123"
+                totp_code:
+                  type: string
+                  description: 6-digit TOTP code (if MFA enabled)
+                  pattern: '^\d{6}$'
+                  example: "123456"
+              required:
+                - username
+                - password
+      responses:
+        '200':
+          description: Authentication successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  token:
+                    type: string
+                    description: JWT access token
+                    example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                  expires_in:
+                    type: integer
+                    description: Token expiration time in seconds
+                    example: 28800
+                  user:
+                    $ref: '#/components/schemas/User'
+        '400':
+          description: Bad request - missing credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - invalid credentials or MFA code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Too many login attempts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/signup:
+    post:
+      summary: Register new employee
+      description: |
+        Register a new ROD employee account with MFA setup.
+        Requires admin privileges or invitation code.
+      tags:
+        - Authentication
+      security:
+        - JWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                  description: Desired username
+                  example: "jdoe"
+                  minLength: 3
+                  maxLength: 50
+                password:
+                  type: string
+                  format: password
+                  description: Password (min 8 chars, mixed case, numbers)
+                  example: "SecurePass123"
+                  minLength: 8
+                email:
+                  type: string
+                  format: email
+                  description: Employee email address
+                  example: "john.doe@rod.gov"
+                full_name:
+                  type: string
+                  description: Employee full name
+                  example: "John Doe"
+                department:
+                  type: string
+                  description: ROD department
+                  example: "Records Management"
+                invitation_code:
+                  type: string
+                  description: Invitation code (if required)
+                  example: "ROD2024INVITE"
+              required:
+                - username
+                - password
+                - email
+                - full_name
+      responses:
+        '201':
+          description: Employee registered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Employee registered successfully"
+                  qr_code:
+                    type: string
+                    description: Base64 encoded QR code for MFA setup
+                    example: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA..."
+                  totp_secret:
+                    type: string
+                    description: TOTP secret for manual MFA setup
+                    example: "JBSWY3DPEHPK3PXP"
+        '400':
+          description: Bad request - validation errors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+        '401':
+          description: Unauthorized - admin privileges required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Conflict - username or email already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/export:
+    get:
+      summary: Export marriage license records
+      description: |
+        Export marriage license records in various formats.
+        Supports CSV, Excel, and PDF report formats.
+      tags:
+        - Export
+      security:
+        - JWT: []
+      parameters:
+        - name: format
+          in: query
+          required: true
+          description: Export format
+          schema:
+            type: string
+            enum: [csv, xlsx, pdf]
+            example: "csv"
+        - name: date_from
+          in: query
+          description: Start date for export range
+          required: false
+          schema:
+            type: string
+            format: date
+            example: "2023-01-01"
+        - name: date_to
+          in: query
+          description: End date for export range
+          required: false
+          schema:
+            type: string
+            format: date
+            example: "2023-12-31"
+        - name: include_documents
+          in: query
+          description: Include document attachments in export
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Export file generated successfully
+          content:
+            application/csv:
+              schema:
+                type: string
+                format: binary
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+          headers:
+            Content-Disposition:
+              description: Attachment filename
+              schema:
+                type: string
+                example: "marriage_licenses_2023.csv"
+        '400':
+          description: Bad request - invalid format or parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /uploads/{filename}:
+    get:
+      summary: Serve uploaded document files
+      description: |
+        Retrieve uploaded document files (PDFs, images) for viewing.
+        Files are served with appropriate MIME types.
+      tags:
+        - Files
+      security:
+        - JWT: []
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          description: Filename of the uploaded document
+          schema:
+            type: string
+            example: "1759286121101-114686440.pdf"
+      responses:
+        '200':
+          description: File served successfully
+          content:
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/tiff:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: File not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    JWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token obtained from /api/login
+    BasicAuth:
+      type: http
+      scheme: basic
+      description: Basic authentication (username:password)
+
+  schemas:
+    MarriageLicense:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: Unique record identifier
+          example: 123
+        name_spouse1:
+          type: string
+          description: First spouse name
+          example: "Mary Orlowska"
+        name_spouse2:
+          type: string
+          description: Second spouse name
+          example: "Josef PaezKowski"
+        marriage_date:
+          type: string
+          format: date
+          description: Marriage date
+          example: "1890-02-12"
+        license_number:
+          type: string
+          description: License or application number
+          example: "37014"
+        file_path:
+          type: string
+          description: Internal file path
+          example: "1759286121101-114686440.pdf"
+        original_filename:
+          type: string
+          description: Original uploaded filename
+          example: "marriage_license_1890.pdf"
+        created_at:
+          type: string
+          format: date-time
+          description: Record creation timestamp
+          example: "2024-01-15T10:30:00Z"
+      required:
+        - id
+        - name_spouse1
+        - name_spouse2
+        - marriage_date
+
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+          description: User ID
+          example: 1
+        username:
+          type: string
+          description: Username
+          example: "jdoe"
+        email:
+          type: string
+          format: email
+          description: Email address
+          example: "john.doe@rod.gov"
+        full_name:
+          type: string
+          description: Full name
+          example: "John Doe"
+        department:
+          type: string
+          description: Department
+          example: "Records Management"
+        role:
+          type: string
+          enum: [admin, user, viewer]
+          description: User role
+          example: "user"
+        mfa_enabled:
+          type: boolean
+          description: Whether MFA is enabled
+          example: true
+        last_login:
+          type: string
+          format: date-time
+          description: Last login timestamp
+          example: "2024-01-15T09:00:00Z"
+      required:
+        - id
+        - username
+        - email
+        - full_name
+        - role
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: "Record not found"
+        code:
+          type: string
+          description: Error code
+          example: "NOT_FOUND"
+        details:
+          type: object
+          description: Additional error details
+          additionalProperties: true
+      required:
+        - error
+
+    ValidationError:
+      type: object
+      properties:
+        error:
+          type: string
+          description: General error message
+          example: "Validation failed"
+        validation_errors:
+          type: object
+          description: Field-specific validation errors
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            username: ["Username must be at least 3 characters"]
+            password: ["Password must contain at least 8 characters", "Password must contain uppercase and lowercase letters"]
+      required:
+        - error
+        - validation_errors
+
+tags:
+  - name: Authentication
+    description: User authentication and registration
+  - name: Marriage Licenses
+    description: Marriage license record management
+  - name: OCR
+    description: Optical Character Recognition processing
+  - name: Export
+    description: Data export functionality
+  - name: Files
+    description: File serving and management
